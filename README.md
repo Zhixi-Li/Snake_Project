@@ -182,10 +182,12 @@
   python scripts/rsl_rl/train.py --task Snake-VelocityTracking-Flat-v0 --num_envs 4096 --headless
   ```
 
-- 执行训练好的策略
+- 执行训练好的策略,控制蛇形机器人的姿态来跟随cmd_vx和cmd_vy设置的运动速度
 
   ```bash
   python scripts/rsl_rl/play.py --task Snake-VelocityTracking-Flat-Play-v0 --checkpoint <your policy> --video --cmd_vx <your speed> --cmd_vy <your speed> --headless
+
+  python scripts/rsl_rl/play.py --task Snake-VelocityTracking-Flat-Play-v0 --checkpoint logs/rsl_rl/snake_velocity_flat_tracking/2026-05-29_13-19-31/model_4999.pt  --video --headless --plot --cmd_vx 0.2
   ```
 
   
