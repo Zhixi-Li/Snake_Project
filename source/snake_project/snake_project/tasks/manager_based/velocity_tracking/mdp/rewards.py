@@ -51,6 +51,23 @@ def phase_propagation(env: "ManagerBasedRLEnv", asset_cfg: SceneEntityCfg = Scen
     return -torch.mean(normalized_product, dim=1)
 
 
+def joint_curvature_l2(env: "ManagerBasedRLEnv", asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")) -> torch.Tensor:
+    """Penalize sharp local bends in the active yaw-joint chain."""
+    asset: Articulation = env.scene[asset_cfg.name]
+    joint_pos = asset.data.joint_pos[:, asset_cfg.joint_ids]
+    if joint_pos.shape[1] < 3:
+        return torch.zeros(env.num_envs, device=env.device)
+    curvature = joint_pos[:, 2:] - 2.0 * joint_pos[:, 1:-1] + joint_pos[:, :-2]
+    return torch.mean(torch.square(curvature), dim=1)
+
+
+def joint_mean_bend_l2(env: "ManagerBasedRLEnv", asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")) -> torch.Tensor:
+    """Penalize persistent whole-body C-shaped bending around one side."""
+    asset: Articulation = env.scene[asset_cfg.name]
+    joint_pos = asset.data.joint_pos[:, asset_cfg.joint_ids]
+    return torch.square(torch.mean(joint_pos, dim=1))
+
+
 class RawActionRatePenalty(ManagerTermBase):
     """L2 penalty on the first-order raw action-rate."""
 
@@ -191,6 +208,106 @@ class VirtualChassisTrackAngVelZExp(ManagerTermBase):
         ang_vel_error = torch.square(env.command_manager.get_command(command_name)[:, 2] - actual_ang_vel_z_vc)
         return torch.exp(-ang_vel_error / std**2)
 
+
+
+class VirtualChassisLateralVelocityPenalty(ManagerTermBase):
+    """Penalize velocity perpendicular to the commanded planar direction."""
+
+    def __init__(self, cfg, env: "ManagerBasedRLEnv"):
+        super().__init__(cfg, env)
+        self.asset_cfg: SceneEntityCfg = cfg.params["asset_cfg"]
+        self.asset: Articulation = env.scene[self.asset_cfg.name]
+        self.prev_axes_w = torch.zeros(self.num_envs, 3, 3, device=self.device)
+        self.has_prev_axes = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+
+    def reset(self, env_ids=None) -> dict[str, float]:
+        env_ids = _resolve_env_ids(self.num_envs, self.device, env_ids)
+        if env_ids is None:
+            self.prev_axes_w.zero_()
+            self.has_prev_axes.zero_()
+        else:
+            self.prev_axes_w[env_ids] = 0.0
+            self.has_prev_axes[env_ids] = False
+        return {}
+
+    def __call__(
+        self,
+        env: "ManagerBasedRLEnv",
+        command_name: str,
+        asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+        command_deadband: float = 0.03,
+    ) -> torch.Tensor:
+        body_pos_w = self.asset.data.body_pos_w[:, self.asset_cfg.body_ids, :]
+        body_lin_vel_w = self.asset.data.body_lin_vel_w[:, self.asset_cfg.body_ids, :]
+        body_ang_vel_w = self.asset.data.body_ang_vel_w[:, self.asset_cfg.body_ids, :]
+        if not torch.isfinite(body_pos_w).all():
+            return torch.zeros(self.num_envs, device=self.device)
+
+        _, axes_w, actual_lin_vel_vc, _ = compute_virtual_chassis_command_terms(
+            body_pos_w=body_pos_w,
+            body_lin_vel_w=body_lin_vel_w,
+            body_ang_vel_w=body_ang_vel_w,
+            prev_axes_w=self.prev_axes_w,
+            has_prev=self.has_prev_axes,
+        )
+        if not torch.isfinite(axes_w).all() or not torch.isfinite(actual_lin_vel_vc).all():
+            return torch.zeros(self.num_envs, device=self.device)
+
+        self.prev_axes_w.copy_(axes_w)
+        self.has_prev_axes[:] = True
+
+        command_xy = env.command_manager.get_command(command_name)[:, :2]
+        actual_xy = actual_lin_vel_vc[:, :2]
+        command_norm = torch.linalg.norm(command_xy, dim=1, keepdim=True)
+        command_unit = command_xy / torch.clamp(command_norm, min=1.0e-6)
+        forward_speed = torch.sum(actual_xy * command_unit, dim=1, keepdim=True)
+        lateral_velocity = actual_xy - forward_speed * command_unit
+        lateral_error = torch.sum(torch.square(lateral_velocity), dim=1)
+        stop_error = torch.sum(torch.square(actual_xy), dim=1)
+        moving = command_norm.squeeze(1) > command_deadband
+        return torch.where(moving, lateral_error, stop_error)
+
+
+class VirtualChassisYawRateAbsPenalty(ManagerTermBase):
+    """Penalize absolute virtual-chassis yaw rate, useful when wz command is zero."""
+
+    def __init__(self, cfg, env: "ManagerBasedRLEnv"):
+        super().__init__(cfg, env)
+        self.asset_cfg: SceneEntityCfg = cfg.params["asset_cfg"]
+        self.asset: Articulation = env.scene[self.asset_cfg.name]
+        self.prev_axes_w = torch.zeros(self.num_envs, 3, 3, device=self.device)
+        self.has_prev_axes = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+
+    def reset(self, env_ids=None) -> dict[str, float]:
+        env_ids = _resolve_env_ids(self.num_envs, self.device, env_ids)
+        if env_ids is None:
+            self.prev_axes_w.zero_()
+            self.has_prev_axes.zero_()
+        else:
+            self.prev_axes_w[env_ids] = 0.0
+            self.has_prev_axes[env_ids] = False
+        return {}
+
+    def __call__(self, env: "ManagerBasedRLEnv", asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")) -> torch.Tensor:
+        body_pos_w = self.asset.data.body_pos_w[:, self.asset_cfg.body_ids, :]
+        body_lin_vel_w = self.asset.data.body_lin_vel_w[:, self.asset_cfg.body_ids, :]
+        body_ang_vel_w = self.asset.data.body_ang_vel_w[:, self.asset_cfg.body_ids, :]
+        if not torch.isfinite(body_pos_w).all():
+            return torch.zeros(self.num_envs, device=self.device)
+
+        _, axes_w, _, actual_ang_vel_z_vc = compute_virtual_chassis_command_terms(
+            body_pos_w=body_pos_w,
+            body_lin_vel_w=body_lin_vel_w,
+            body_ang_vel_w=body_ang_vel_w,
+            prev_axes_w=self.prev_axes_w,
+            has_prev=self.has_prev_axes,
+        )
+        if not torch.isfinite(axes_w).all() or not torch.isfinite(actual_ang_vel_z_vc).all():
+            return torch.zeros(self.num_envs, device=self.device)
+
+        self.prev_axes_w.copy_(axes_w)
+        self.has_prev_axes[:] = True
+        return torch.abs(actual_ang_vel_z_vc)
 
 def contact_penalty(
     env: "ManagerBasedRLEnv",

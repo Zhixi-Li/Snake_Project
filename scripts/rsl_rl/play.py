@@ -59,6 +59,7 @@ simulation_app = app_launcher.app
 
 """Rest everything follows."""
 
+import csv
 import gymnasium as gym
 import os
 import random
@@ -187,6 +188,9 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     vc_xy = []
     base_xy = []
     base_vel = []
+    action_abs_mean = []
+    joint_pos_abs_mean = []
+    joint_vel_abs_mean = []
     base_body_id = None
     if record_plot:
         try:
@@ -271,6 +275,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
                 vc_act_vy.append(float(lin_vel_vc[0, 1].item()))
                 vc_act_wz.append(float(ang_vel_z_vc[0].item()))
                 vc_xy.append((float(origin_w[0, 0].item()), float(origin_w[0, 1].item())))
+                action_abs_mean.append(float(torch.mean(torch.abs(actions[0])).item()))
                 if base_body_id is not None:
                     robot = base_env.scene["robot"]
                     base_pos_w = robot.data.body_pos_w[0, base_body_id, :]
@@ -279,6 +284,8 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
                     base_vel.append(
                         (float(base_vel_w[0].item()), float(base_vel_w[1].item()), float(base_vel_w[2].item()))
                     )
+                    joint_pos_abs_mean.append(float(torch.mean(torch.abs(robot.data.joint_pos[0])).item()))
+                    joint_vel_abs_mean.append(float(torch.mean(torch.abs(robot.data.joint_vel[0])).item()))
         if args_cli.video:
             timestep += 1
             # Exit the play loop after recording one video
@@ -362,6 +369,94 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
                 fig.tight_layout()
                 fig.savefig(os.path.join(plot_dir, "base_link_velocity.png"), dpi=200)
                 plt.close(fig)
+
+            diag_csv = os.path.join(plot_dir, "play_timeseries.csv")
+            with open(diag_csv, "w", newline="") as csv_file:
+                writer = csv.DictWriter(
+                    csv_file,
+                    fieldnames=[
+                        "time_s",
+                        "cmd_vx",
+                        "cmd_vy",
+                        "cmd_wz",
+                        "act_vx",
+                        "act_vy",
+                        "act_wz",
+                        "err_vx",
+                        "err_vy",
+                        "err_wz",
+                        "planar_error",
+                        "action_abs_mean",
+                        "joint_pos_abs_mean",
+                        "joint_vel_abs_mean",
+                    ],
+                )
+                writer.writeheader()
+                for i, t in enumerate(vc_cmd_times):
+                    err_vx = vc_cmd_vx[i] - vc_act_vx[i]
+                    err_vy = vc_cmd_vy[i] - vc_act_vy[i]
+                    err_wz = vc_cmd_wz[i] - vc_act_wz[i]
+                    writer.writerow(
+                        {
+                            "time_s": t,
+                            "cmd_vx": vc_cmd_vx[i],
+                            "cmd_vy": vc_cmd_vy[i],
+                            "cmd_wz": vc_cmd_wz[i],
+                            "act_vx": vc_act_vx[i],
+                            "act_vy": vc_act_vy[i],
+                            "act_wz": vc_act_wz[i],
+                            "err_vx": err_vx,
+                            "err_vy": err_vy,
+                            "err_wz": err_wz,
+                            "planar_error": float(np.sqrt(err_vx**2 + err_vy**2 + err_wz**2)),
+                            "action_abs_mean": action_abs_mean[i] if i < len(action_abs_mean) else float("nan"),
+                            "joint_pos_abs_mean": joint_pos_abs_mean[i] if i < len(joint_pos_abs_mean) else float("nan"),
+                            "joint_vel_abs_mean": joint_vel_abs_mean[i] if i < len(joint_vel_abs_mean) else float("nan"),
+                        }
+                    )
+
+            times = np.asarray(vc_cmd_times, dtype=np.float64)
+            cmd_vx = np.asarray(vc_cmd_vx, dtype=np.float64)
+            cmd_vy = np.asarray(vc_cmd_vy, dtype=np.float64)
+            cmd_wz = np.asarray(vc_cmd_wz, dtype=np.float64)
+            act_vx = np.asarray(vc_act_vx, dtype=np.float64)
+            act_vy = np.asarray(vc_act_vy, dtype=np.float64)
+            act_wz = np.asarray(vc_act_wz, dtype=np.float64)
+            warmup_s = min(3.0, max(0.0, float(times[-1]) * 0.25))
+            mask = times >= warmup_s
+            if not np.any(mask):
+                mask = np.ones_like(times, dtype=bool)
+            err_vx = cmd_vx[mask] - act_vx[mask]
+            err_vy = cmd_vy[mask] - act_vy[mask]
+            err_wz = cmd_wz[mask] - act_wz[mask]
+            planar_error = np.sqrt(err_vx**2 + err_vy**2 + err_wz**2)
+            summary = {
+                "samples": int(mask.sum()),
+                "warmup_s": float(warmup_s),
+                "mae_vx": float(np.mean(np.abs(err_vx))),
+                "mae_vy": float(np.mean(np.abs(err_vy))),
+                "mae_wz": float(np.mean(np.abs(err_wz))),
+                "mae_planar": float(np.mean(planar_error)),
+                "rmse_planar": float(np.sqrt(np.mean(np.square(planar_error)))),
+                "act_vx_mean": float(np.mean(act_vx[mask])),
+                "act_vy_mean": float(np.mean(act_vy[mask])),
+                "act_wz_abs_mean": float(np.mean(np.abs(act_wz[mask]))),
+                "act_vx_std": float(np.std(act_vx[mask])),
+                "act_vy_std": float(np.std(act_vy[mask])),
+                "act_wz_std": float(np.std(act_wz[mask])),
+                "action_abs_mean": float(np.nanmean(action_abs_mean)) if action_abs_mean else float("nan"),
+                "joint_pos_abs_mean": float(np.nanmean(joint_pos_abs_mean)) if joint_pos_abs_mean else float("nan"),
+                "joint_vel_abs_mean": float(np.nanmean(joint_vel_abs_mean)) if joint_vel_abs_mean else float("nan"),
+            }
+            with open(os.path.join(plot_dir, "diagnostics_summary.md"), "w") as summary_file:
+                summary_file.write("# Play Diagnostics Summary\n\n")
+                summary_file.write(f"checkpoint: `{resume_path}`\n\n")
+                summary_file.write(f"command: vx={args_cli.cmd_vx:.4f}, vy={args_cli.cmd_vy:.4f}, wz={args_cli.cmd_wz:.4f}\n\n")
+                summary_file.write(f"warmup excluded: {summary['warmup_s']:.3f} s\n\n")
+                summary_file.write("| metric | value |\n")
+                summary_file.write("| --- | ---: |\n")
+                for key, value in summary.items():
+                    summary_file.write(f"| {key} | {value:.6f} |\n" if isinstance(value, float) else f"| {key} | {value} |\n")
         except Exception as exc:
             print(f"[WARN] Plotting failed: {exc}")
 

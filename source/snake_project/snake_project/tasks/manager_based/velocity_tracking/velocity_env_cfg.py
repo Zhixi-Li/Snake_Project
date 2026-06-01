@@ -93,8 +93,8 @@ class SnakeVelocityCommandsCfg:
         velocity_marker_max_speed=0.75,
         velocity_marker_z_offset=0.10,
         ranges=mdp.VirtualChassisVelocityCommandCfg.Ranges(
-            lin_vel_x=(-0.4, 0.4),
-            lin_vel_y=(-0.2, 0.2),
+            lin_vel_x=(-0.25, 0.25),
+            lin_vel_y=(-0.12, 0.12),
             ang_vel_z=(-0.0, 0.0),
             heading=(-0.0, 0.0),
         ),
@@ -237,21 +237,33 @@ class SnakeVelocityRewardsCfg:
 
     track_lin_vel_xy_exp = RewTerm(
         func=mdp.VirtualChassisTrackLinVelXYExp,
-        weight=5.0,
+        weight=6.0,
         params={"command_name": "base_velocity", "std": 0.4, "linear_coef": 0.5, "asset_cfg": virtual_chassis_body_cfg()},
     )
     track_ang_vel_z_exp = RewTerm(
         func=mdp.VirtualChassisTrackAngVelZExp,
-        weight=1.0,
+        weight=1.5,
         params={"command_name": "base_velocity", "std": 0.25, "asset_cfg": virtual_chassis_body_cfg()},
     )
     ang_vel_xy_l2 = RewTerm(func=mdp.ang_vel_xy_l2, weight=-0.05)
     joint_torques_l2 = RewTerm(func=mdp.joint_torques_l2, weight=-1.0e-4, params={"asset_cfg": yaw_joint_cfg()})
-    joint_acc_l2 = RewTerm(func=mdp.joint_acc_l2, weight=-2.5e-7, params={"asset_cfg": yaw_joint_cfg()})
-    raw_action_rate = RewTerm(func=mdp.RawActionRatePenalty, weight=-0.01, params={"action_term_name": "joint_pos"})
-    joint_amplitude = RewTerm(func=mdp.joint_amplitude, weight=0.2, params={"asset_cfg": yaw_joint_cfg()})
-    phase_propagation = RewTerm(func=mdp.phase_propagation, weight=0.4, params={"asset_cfg": yaw_joint_cfg()})
-    motion_coordination = RewTerm(func=mdp.motion_coordination, weight=-0.5, params={"asset_cfg": yaw_joint_cfg()})
+    joint_acc_l2 = RewTerm(func=mdp.joint_acc_l2, weight=-5.0e-7, params={"asset_cfg": yaw_joint_cfg()})
+    raw_action_rate = RewTerm(func=mdp.RawActionRatePenalty, weight=-0.015, params={"action_term_name": "joint_pos"})
+    vc_lateral_velocity_l2 = RewTerm(
+        func=mdp.VirtualChassisLateralVelocityPenalty,
+        weight=-1.0,
+        params={"command_name": "base_velocity", "command_deadband": 0.03, "asset_cfg": virtual_chassis_body_cfg()},
+    )
+    vc_yaw_rate_abs = RewTerm(
+        func=mdp.VirtualChassisYawRateAbsPenalty,
+        weight=-0.2,
+        params={"asset_cfg": virtual_chassis_body_cfg()},
+    )
+    joint_curvature_l2 = RewTerm(func=mdp.joint_curvature_l2, weight=-0.04, params={"asset_cfg": yaw_joint_cfg()})
+    joint_mean_bend_l2 = RewTerm(func=mdp.joint_mean_bend_l2, weight=-0.05, params={"asset_cfg": yaw_joint_cfg()})
+    joint_amplitude = RewTerm(func=mdp.joint_amplitude, weight=0.15, params={"asset_cfg": yaw_joint_cfg()})
+    phase_propagation = RewTerm(func=mdp.phase_propagation, weight=0.3, params={"asset_cfg": yaw_joint_cfg()})
+    motion_coordination = RewTerm(func=mdp.motion_coordination, weight=-0.4, params={"asset_cfg": yaw_joint_cfg()})
 
 @configclass
 class SnakeVelocityTerminationsCfg:
@@ -274,17 +286,17 @@ class SnakeVelocityTerminationsCfg:
 class SnakeVelocityCurriculumCfg:
     """Curriculum hooks for the velocity-tracking task."""
 
-    # command = CurrTerm(
-    #     func=mdp.command_velocity_curriculum,
-    #     params={
-    #         "command_name": "base_velocity",
-    #         "reward_term_name": "track_lin_vel_xy_exp",
-    #         "max_curriculum": 0.4,
-    #         "min_curriculum": 0.1,
-    #         "step_size": 0.05,
-    #         "threshold_ratio": 0.8,
-    #     },
-    # )
+    command = CurrTerm(
+        func=mdp.command_velocity_curriculum,
+        params={
+            "command_name": "base_velocity",
+            "reward_term_name": "track_lin_vel_xy_exp",
+            "max_curriculum": 0.25,
+            "min_curriculum": 0.05,
+            "step_size": 0.025,
+            "threshold_ratio": 0.75,
+        },
+    )
 
 
 @configclass
@@ -306,7 +318,7 @@ class SnakeVelocityEnvCfg(ManagerBasedRLEnvCfg):
         self.sim.dt = 0.005
         self.sim.render_interval = self.decimation
         self.sim.physics_material = self.scene.terrain.physics_material
-        self.sim.physx.gpu_max_rigid_patch_count = 10 * 2**15
+        self.sim.physx.gpu_max_rigid_patch_count = 16 * 2**15
         self.viewer.origin_type = "asset_root"
         self.viewer.env_index = 0
         self.viewer.asset_name = "robot"

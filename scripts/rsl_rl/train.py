@@ -27,6 +27,7 @@ parser.add_argument(
 )
 parser.add_argument("--seed", type=int, default=42, help="Seed used for the environment")
 parser.add_argument("--max_iterations", type=int, default=None, help="RL Policy training iterations.")
+parser.add_argument("--diagnostics_interval", type=int, default=200, help="Write readable training diagnostics every N env steps. Set <= 0 to disable.")
 parser.add_argument(
     "--distributed", action="store_true", default=False, help="Run training with multiple GPUs or nodes."
 )
@@ -75,6 +76,7 @@ if version.parse(installed_version) < version.parse(RSL_RL_VERSION):
 
 """Rest everything follows."""
 
+import csv
 import gymnasium as gym
 import logging
 import os
@@ -111,6 +113,124 @@ torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
 torch.backends.cudnn.deterministic = True
 torch.backends.cudnn.benchmark = False
+
+
+class TrainingDiagnosticsWrapper(gym.Wrapper):
+    """Write compact CSV diagnostics from the IsaacLab environment during training."""
+
+    def __init__(self, env, log_dir: str, interval: int):
+        super().__init__(env)
+        self.interval = max(0, int(interval))
+        self.step_count = 0
+        self.csv_file = None
+        self.csv_writer = None
+        if self.interval > 0:
+            diag_dir = os.path.join(log_dir, "diagnostics")
+            os.makedirs(diag_dir, exist_ok=True)
+            self.csv_file = open(os.path.join(diag_dir, "train_monitor.csv"), "w", newline="")
+            self.csv_writer = csv.DictWriter(
+                self.csv_file,
+                fieldnames=[
+                    "step",
+                    "sim_time_s",
+                    "reward_mean",
+                    "reward_std",
+                    "done_rate",
+                    "cmd_vx_mean",
+                    "cmd_vy_mean",
+                    "act_vx_mean",
+                    "act_vy_mean",
+                    "act_wz_abs_mean",
+                    "vel_xy_mae_mean",
+                    "raw_action_abs_mean",
+                    "joint_pos_abs_mean",
+                    "joint_vel_abs_mean",
+                ],
+            )
+            self.csv_writer.writeheader()
+            self.csv_file.flush()
+
+    @staticmethod
+    def _to_float(value) -> float:
+        if value is None:
+            return float("nan")
+        if isinstance(value, torch.Tensor):
+            if value.numel() == 0:
+                return float("nan")
+            return float(value.detach().mean().cpu().item())
+        return float(value)
+
+    def get_observations(self):
+        return self.env.get_observations()
+
+    def step(self, action):
+        output = self.env.step(action)
+        self.step_count += 1
+        if self.csv_writer is not None and self.step_count % self.interval == 0:
+            self._write_row(output)
+        return output
+
+    def _write_row(self, output) -> None:
+        try:
+            if len(output) == 5:
+                _, rewards, terminated, truncated, _ = output
+                dones = torch.logical_or(torch.as_tensor(terminated), torch.as_tensor(truncated))
+            else:
+                _, rewards, dones, _ = output
+                dones = torch.as_tensor(dones)
+            rewards_t = torch.as_tensor(rewards, dtype=torch.float32)
+            base_env = self.unwrapped
+            row = {
+                "step": self.step_count,
+                "sim_time_s": self.step_count * float(getattr(base_env, "step_dt", 0.0)),
+                "reward_mean": self._to_float(rewards_t.mean()),
+                "reward_std": self._to_float(rewards_t.std(unbiased=False)),
+                "done_rate": self._to_float(dones.float().mean()),
+                "cmd_vx_mean": float("nan"),
+                "cmd_vy_mean": float("nan"),
+                "act_vx_mean": float("nan"),
+                "act_vy_mean": float("nan"),
+                "act_wz_abs_mean": float("nan"),
+                "vel_xy_mae_mean": float("nan"),
+                "raw_action_abs_mean": float("nan"),
+                "joint_pos_abs_mean": float("nan"),
+                "joint_vel_abs_mean": float("nan"),
+            }
+            try:
+                command_term = base_env.command_manager.get_term("base_velocity")
+                command = command_term.command.detach()
+                row["cmd_vx_mean"] = self._to_float(command[:, 0])
+                row["cmd_vy_mean"] = self._to_float(command[:, 1])
+                if hasattr(command_term, "_compute_virtual_state"):
+                    _, _, lin_vel_vc, ang_vel_z_vc = command_term._compute_virtual_state()
+                    row["act_vx_mean"] = self._to_float(lin_vel_vc[:, 0])
+                    row["act_vy_mean"] = self._to_float(lin_vel_vc[:, 1])
+                    row["act_wz_abs_mean"] = self._to_float(torch.abs(ang_vel_z_vc))
+                    row["vel_xy_mae_mean"] = self._to_float(torch.linalg.norm(command[:, :2] - lin_vel_vc[:, :2], dim=1))
+            except Exception:
+                pass
+            try:
+                action_term = base_env.action_manager.get_term("joint_pos")
+                row["raw_action_abs_mean"] = self._to_float(torch.abs(action_term.raw_actions))
+            except Exception:
+                pass
+            try:
+                robot = base_env.scene["robot"]
+                row["joint_pos_abs_mean"] = self._to_float(torch.abs(robot.data.joint_pos))
+                row["joint_vel_abs_mean"] = self._to_float(torch.abs(robot.data.joint_vel))
+            except Exception:
+                pass
+            self.csv_writer.writerow(row)
+            self.csv_file.flush()
+        except Exception as exc:
+            print(f"[WARN] Failed to write training diagnostics: {exc}")
+
+    def close(self):
+        try:
+            if self.csv_file is not None:
+                self.csv_file.close()
+        finally:
+            return super().close()
 
 
 @hydra_task_config(args_cli.task, args_cli.agent)
@@ -197,6 +317,10 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         print("[INFO] Recording videos during training.")
         print_dict(video_kwargs, nesting=4)
         env = gym.wrappers.RecordVideo(env, **video_kwargs)
+
+    # write lightweight CSV diagnostics before adapting the environment to rsl-rl
+    if args_cli.diagnostics_interval > 0:
+        env = TrainingDiagnosticsWrapper(env, log_dir=log_dir, interval=args_cli.diagnostics_interval)
 
     # wrap around environment for rsl-rl
     env = RslRlVecEnvWrapper(env, clip_actions=agent_cfg.clip_actions)
