@@ -179,7 +179,7 @@
 - 运行训练代码
 
 ```bash
-python scripts/rsl_rl/train.py --task Snake-VelocityTracking-Flat-v0 --num_envs 8192 --headless --diagnostics_interval 200 --max_iterations 6000 --kit_args="--/app/extensions/fsWatcherEnabled=false"
+python scripts/rsl_rl/train.py --task Snake-VelocityTracking-Flat-v0 --num_envs 4096 --headless --diagnostics_interval 500 --max_iterations 6000 --kit_args="--/app/extensions/fsWatcherEnabled=false"
 ```
 
 - 执行训练好的策略,控制蛇形机器人的姿态来跟随cmd_vx和cmd_vy设置的运动速度
@@ -187,9 +187,10 @@ python scripts/rsl_rl/train.py --task Snake-VelocityTracking-Flat-v0 --num_envs 
 ```bash
 python scripts/rsl_rl/play.py --task Snake-VelocityTracking-Flat-Play-v0 --checkpoint <your policy> --video --cmd_vx <your speed> --cmd_vy <your speed> --headless
 
-python scripts/rsl_rl/play.py --task Snake-VelocityTracking-Flat-Play-v0 --checkpoint logs/rsl_rl/snake_velocity_flat_tracking/2026-06-02_14-38-42/model_9999.pt  --video --headless --plot --cmd_vx 0.2  --manual_command  --kit_args="--/app/extensions/fsWatcherEnabled=false"
+python scripts/rsl_rl/play.py --task Snake-VelocityTracking-Flat-Play-v0 --checkpoint logs/rsl_rl/snake_velocity_flat_tracking/2026-06-04_07-18-48/model_1000.pt  --video --headless --plot --cmd_vx 0.2  --manual_command  --kit_args="--/app/extensions/fsWatcherEnabled=false"
 
-python sim2sim/sim2sim_eval.py --policy logs/rsl_rl/snake_velocity_flat_tracking/2026-06-02_14-38-42/exported/policy.pt
+python sim2sim/sim2sim_eval.py --policy logs/rsl_rl/snake_velocity_flat_tracking/2026-06-04_07-18-48/exported/policy.pt
+python sim2sim/sim2sim_mujoco.py --cmd_vx 0.2 --cmd_vy 0.2 --policy logs/rsl_rl/snake_velocity_flat_tracking/2026-06-04_07-18-48/exported/policy.pt --headless 1 --plot_show 0
 ```
 
   

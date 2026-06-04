@@ -34,6 +34,12 @@ from typing import Tuple, Dict, List
 
 import numpy as np
 import torch
+
+# Prefer an offscreen MuJoCo backend on machines without an X display. This must
+# be set before importing mujoco for headless rendering to work reliably.
+if "DISPLAY" not in os.environ:
+    os.environ.setdefault("MUJOCO_GL", "egl")
+
 import mujoco
 
 # fix seeds for reproducibility
@@ -277,6 +283,7 @@ class MujocoSim2SimRunner:
 
         # Viewer
         self.viewer = None
+        self.renderer = None
         
         # Logs for tracking evaluation (velocity tracking)
         self._log_t: List[float] = []
@@ -643,11 +650,69 @@ class MujocoSim2SimRunner:
         print(f"[Done] Sim {self.cfg.episode_seconds:.2f}s, wall {wall:.2f}s, RTF={self.cfg.episode_seconds / max(wall,1e-6):.2f}x")
     """
 
-    def run(self, seconds: float, realtime: bool = True, realtime_factor: float = 1.0, lead: float = 0.001):
+    def _start_video_writer(self, video_path: str, width: int, height: int, fps: float):
+        try:
+            import imageio.v2 as imageio
+        except Exception as exc:
+            raise RuntimeError(
+                "Video export requires imageio and an ffmpeg backend. "
+                "Install them with: pip install imageio imageio-ffmpeg"
+            ) from exc
+
+        out_dir = os.path.dirname(video_path) if video_path else ""
+        if out_dir:
+            os.makedirs(out_dir, exist_ok=True)
+
+        try:
+            self.renderer = mujoco.Renderer(self.model, height=int(height), width=int(width))
+        except Exception as exc:
+            raise RuntimeError(
+                "Could not create MuJoCo offscreen renderer. On a headless machine, "
+                "try setting MUJOCO_GL=egl if a GPU/EGL driver is available, or "
+                "MUJOCO_GL=osmesa if OSMesa is installed."
+            ) from exc
+
+        writer = imageio.get_writer(video_path, fps=float(fps), macro_block_size=16)
+        print(f"[Video] Recording to: {video_path} ({int(width)}x{int(height)} @ {float(fps):.1f} fps)")
+        return writer
+
+    def _render_video_frame(self, writer, camera: str | int | None = None):
+        if self.renderer is None:
+            return
+        if camera is None or camera == "":
+            self.renderer.update_scene(self.data)
+        else:
+            self.renderer.update_scene(self.data, camera=camera)
+        writer.append_data(self.renderer.render())
+
+    def _close_video(self):
+        if self.renderer is not None:
+            self.renderer.close()
+            self.renderer = None
+
+    def run(
+        self,
+        seconds: float,
+        realtime: bool = True,
+        realtime_factor: float = 1.0,
+        lead: float = 0.001,
+        video_path: str | None = None,
+        video_fps: float = 30.0,
+        video_width: int = 1280,
+        video_height: int = 720,
+        video_camera: str | int | None = None,
+    ):
         self.reset()
 
         if (not self.headless) and HAS_VIEWER:
             self.viewer = mujoco.viewer.launch_passive(self.model, self.data)
+
+        video_writer = None
+        video_interval = None
+        next_video_t = 0.0
+        if video_path:
+            video_writer = self._start_video_writer(video_path, video_width, video_height, video_fps)
+            video_interval = 1.0 / max(float(video_fps), 1e-6)
 
         steps = int(seconds / self.mj_dt)
         t0 = time.time()
@@ -660,41 +725,50 @@ class MujocoSim2SimRunner:
         sim_elapsed = 0.0
 
         sim_t = 0.0
-        for k in range(steps):
-            # commands updated every sim step, resampled every resampling_time
-            _, _, _, yaw = self._get_base_kinematics()
-            cmd4 = self.cmd_sampler.step(self.mj_dt, yaw)
+        try:
+            for k in range(steps):
+                # commands updated every sim step, resampled every resampling_time
+                _, _, _, yaw = self._get_base_kinematics()
+                cmd4 = self.cmd_sampler.step(self.mj_dt, yaw)
 
-            # policy update every decimation steps (deferred 3s for physics settling)
-            if k % self.decimation == 0:
-                if sim_t >= 0.5:
-                    obs = self._build_obs(cmd4)
-                    action = self._policy(obs)
-                    self.last_actions[:] = action
+                # policy update every decimation steps (deferred 3s for physics settling)
+                if k % self.decimation == 0:
+                    if sim_t >= 0.5:
+                        obs = self._build_obs(cmd4)
+                        action = self._policy(obs)
+                        self.last_actions[:] = action
 
-            # apply target positions
-            self._apply_position_targets(self.last_actions)
+                # apply target positions
+                self._apply_position_targets(self.last_actions)
 
-            # log before stepping so velocities correspond to this control step
-            self._log_step(sim_t, cmd4)
+                # log before stepping so velocities correspond to this control step
+                self._log_step(sim_t, cmd4)
 
-            mujoco.mj_step(self.model, self.data)
+                mujoco.mj_step(self.model, self.data)
 
-            sim_t += self.mj_dt
+                sim_t += self.mj_dt
+                if video_writer is not None and sim_t + 1e-12 >= next_video_t:
+                    self._render_video_frame(video_writer, video_camera)
+                    next_video_t += video_interval
 
-            if realtime:
-                sim_elapsed += self.mj_dt
-                target_wall = sim_elapsed / max(realtime_factor, 1e-6)
-                wall_elapsed = time.perf_counter() - t_wall0
-                sleep_s = target_wall - wall_elapsed - lead
-                if sleep_s > 0:
-                    time.sleep(sleep_s)
+                if realtime:
+                    sim_elapsed += self.mj_dt
+                    target_wall = sim_elapsed / max(realtime_factor, 1e-6)
+                    wall_elapsed = time.perf_counter() - t_wall0
+                    sleep_s = target_wall - wall_elapsed - lead
+                    if sleep_s > 0:
+                        time.sleep(sleep_s)
 
+                if self.viewer is not None:
+                    self.viewer.sync()
+        finally:
+            if video_writer is not None:
+                video_writer.close()
+                print(f"[Video] Saved: {video_path}")
+            self._close_video()
             if self.viewer is not None:
-                self.viewer.sync()
-
-        if self.viewer is not None:
-            self.viewer.close()
+                self.viewer.close()
+                self.viewer = None
 
         wall = time.time() - t0
         print(f"[Done] Sim {seconds:.2f}s, wall {wall:.2f}s, RTF={seconds / max(wall,1e-6):.2f}x")
@@ -716,6 +790,12 @@ def parse_args():
     ap.add_argument("--plot", type=int, default=1, help="1=save tracking plot at end, 0=disable")
     ap.add_argument("--plot_path", type=str, default="sim2sim/figures/velocity_tracking.png", help="Output path for the tracking plot")
     ap.add_argument("--plot_show", type=int, default=1, help="1=show matplotlib window, 0=only save")
+    ap.add_argument("--video", type=int, default=0, help="1=save an offscreen rendered mp4 video, 0=disable")
+    ap.add_argument("--video_path", type=str, default="sim2sim/videos/sim2sim_mujoco.mp4", help="Output path for the mp4 video")
+    ap.add_argument("--video_fps", type=float, default=30.0, help="Output video frame rate")
+    ap.add_argument("--video_width", type=int, default=1280, help="Output video width in pixels")
+    ap.add_argument("--video_height", type=int, default=720, help="Output video height in pixels")
+    ap.add_argument("--video_camera", type=str, default="", help="Optional MuJoCo camera name or camera id")
     
     # Fixed command options (if not specified, use random sampling)
     ap.add_argument("--cmd_vx", type=float, default=0.0, help="Fixed vx command (m/s). If set, disables random sampling.")
@@ -742,7 +822,20 @@ def main():
     
     cfg = LeggedGymLikeCfg(device=args.device, seed=args.seed, fixed_command=fixed_cmd)
     runner = MujocoSim2SimRunner(args.mjcf, args.policy, cfg, headless=bool(args.headless))
-    runner.run(seconds=float(args.seconds), realtime=bool(args.realtime), realtime_factor=float(args.rtf), lead=float(args.lead))
+    video_camera = None
+    if args.video_camera != "":
+        video_camera = int(args.video_camera) if args.video_camera.isdigit() else args.video_camera
+    runner.run(
+        seconds=float(args.seconds),
+        realtime=bool(args.realtime),
+        realtime_factor=float(args.rtf),
+        lead=float(args.lead),
+        video_path=str(args.video_path) if int(args.video) == 1 else None,
+        video_fps=float(args.video_fps),
+        video_width=int(args.video_width),
+        video_height=int(args.video_height),
+        video_camera=video_camera,
+    )
     if int(args.plot) == 1:
         runner.plot_playback_tracking(plot_path=str(args.plot_path), show=bool(args.plot_show))
 
