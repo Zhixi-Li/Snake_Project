@@ -179,7 +179,7 @@
 - 运行训练代码
 
 ```bash
-python scripts/rsl_rl/train.py --task Snake-VelocityTracking-Flat-v0 --num_envs 8192 --headless --diagnostics_interval 200
+python scripts/rsl_rl/train.py --task Snake-VelocityTracking-Flat-v0 --num_envs 8192 --headless --diagnostics_interval 200 --max_iterations 6000 --kit_args="--/app/extensions/fsWatcherEnabled=false"
 ```
 
 - 执行训练好的策略,控制蛇形机器人的姿态来跟随cmd_vx和cmd_vy设置的运动速度
@@ -187,7 +187,9 @@ python scripts/rsl_rl/train.py --task Snake-VelocityTracking-Flat-v0 --num_envs 
 ```bash
 python scripts/rsl_rl/play.py --task Snake-VelocityTracking-Flat-Play-v0 --checkpoint <your policy> --video --cmd_vx <your speed> --cmd_vy <your speed> --headless
 
-python scripts/rsl_rl/play.py --task Snake-VelocityTracking-Flat-Play-v0 --checkpoint logs/rsl_rl/snake_velocity_flat_tracking/2026-06-01_03-27-21/model_9999.pt  --video --headless --plot --cmd_vx 0.2  --manual_command
+python scripts/rsl_rl/play.py --task Snake-VelocityTracking-Flat-Play-v0 --checkpoint logs/rsl_rl/snake_velocity_flat_tracking/2026-06-02_14-38-42/model_9999.pt  --video --headless --plot --cmd_vx 0.2  --manual_command  --kit_args="--/app/extensions/fsWatcherEnabled=false"
+
+python sim2sim/sim2sim_eval.py --policy logs/rsl_rl/snake_velocity_flat_tracking/2026-06-02_14-38-42/exported/policy.pt
 ```
 
   
@@ -377,7 +379,7 @@ python scripts/rsl_rl/play.py --task Snake-VelocityTracking-Flat-Play-v0 --check
 ```
 python sim2sim/sim2sim_eval.py --policy <your jit policy>
 
-python sim2sim/sim2sim_eval.py --policy logs/rsl_rl/snake_velocity_flat_tracking/2026-06-01_03-27-21/exported/policy.pt
+
 ```
 
   > 请注意Mujoco脚本使用的是jit策略，一般需要先用IsaacLab运行play.py，在对应log文件夹下找到export\xxx.pt，这个才是jit的格式

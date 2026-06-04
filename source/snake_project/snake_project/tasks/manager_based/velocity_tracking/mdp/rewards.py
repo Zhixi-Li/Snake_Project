@@ -68,6 +68,28 @@ def joint_mean_bend_l2(env: "ManagerBasedRLEnv", asset_cfg: SceneEntityCfg = Sce
     return torch.square(torch.mean(joint_pos, dim=1))
 
 
+def leader_follower_joint_pos_l2(env: "ManagerBasedRLEnv", asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")) -> torch.Tensor:
+    """Penalize follower yaw joints deviating from neighboring leader-joint interpolation."""
+    asset: Articulation = env.scene[asset_cfg.name]
+    joint_pos = asset.data.joint_pos[:, asset_cfg.joint_ids]
+    if joint_pos.shape[1] < 7:
+        return torch.zeros(env.num_envs, device=env.device)
+    follower = joint_pos[:, [1, 3, 5]]
+    leader_mean = 0.5 * (joint_pos[:, [0, 2, 4]] + joint_pos[:, [2, 4, 6]])
+    return torch.mean(torch.square(follower - leader_mean), dim=1)
+
+
+def leader_follower_joint_vel_l2(env: "ManagerBasedRLEnv", asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")) -> torch.Tensor:
+    """Penalize follower yaw-joint velocities deviating from neighboring leader interpolation."""
+    asset: Articulation = env.scene[asset_cfg.name]
+    joint_vel = asset.data.joint_vel[:, asset_cfg.joint_ids]
+    if joint_vel.shape[1] < 7:
+        return torch.zeros(env.num_envs, device=env.device)
+    follower = joint_vel[:, [1, 3, 5]]
+    leader_mean = 0.5 * (joint_vel[:, [0, 2, 4]] + joint_vel[:, [2, 4, 6]])
+    return torch.mean(torch.square(follower - leader_mean), dim=1)
+
+
 class RawActionRatePenalty(ManagerTermBase):
     """L2 penalty on the first-order raw action-rate."""
 
@@ -155,6 +177,57 @@ class VirtualChassisTrackLinVelXYExp(ManagerTermBase):
         exp_reward = torch.exp(-lin_vel_error / std**2)
         lin_penalty = linear_coef * torch.sqrt(lin_vel_error)
         return exp_reward - lin_penalty
+
+
+class VirtualChassisTrackVelYExp(ManagerTermBase):
+    """Reward y-velocity command tracking in the virtual chassis frame."""
+
+    def __init__(self, cfg, env: "ManagerBasedRLEnv"):
+        super().__init__(cfg, env)
+        self.asset_cfg: SceneEntityCfg = cfg.params["asset_cfg"]
+        self.asset: Articulation = env.scene[self.asset_cfg.name]
+        self.prev_axes_w = torch.zeros(self.num_envs, 3, 3, device=self.device)
+        self.has_prev_axes = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+
+    def reset(self, env_ids=None) -> dict[str, float]:
+        env_ids = _resolve_env_ids(self.num_envs, self.device, env_ids)
+        if env_ids is None:
+            self.prev_axes_w.zero_()
+            self.has_prev_axes.zero_()
+        else:
+            self.prev_axes_w[env_ids] = 0.0
+            self.has_prev_axes[env_ids] = False
+        return {}
+
+    def __call__(
+        self,
+        env: "ManagerBasedRLEnv",
+        command_name: str,
+        std: float,
+        asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+        linear_coef: float = 0.0,
+    ) -> torch.Tensor:
+        body_pos_w = self.asset.data.body_pos_w[:, self.asset_cfg.body_ids, :]
+        body_lin_vel_w = self.asset.data.body_lin_vel_w[:, self.asset_cfg.body_ids, :]
+        body_ang_vel_w = self.asset.data.body_ang_vel_w[:, self.asset_cfg.body_ids, :]
+        if not torch.isfinite(body_pos_w).all():
+            return torch.zeros(self.num_envs, device=self.device)
+
+        _, axes_w, actual_lin_vel_vc, _ = compute_virtual_chassis_command_terms(
+            body_pos_w=body_pos_w,
+            body_lin_vel_w=body_lin_vel_w,
+            body_ang_vel_w=body_ang_vel_w,
+            prev_axes_w=self.prev_axes_w,
+            has_prev=self.has_prev_axes,
+        )
+        if not torch.isfinite(axes_w).all() or not torch.isfinite(actual_lin_vel_vc).all():
+            return torch.zeros(self.num_envs, device=self.device)
+
+        self.prev_axes_w.copy_(axes_w)
+        self.has_prev_axes[:] = True
+
+        vel_y_error_abs = torch.abs(env.command_manager.get_command(command_name)[:, 1] - actual_lin_vel_vc[:, 1])
+        return torch.exp(-torch.square(vel_y_error_abs) / std**2) - linear_coef * vel_y_error_abs
 
 
 class VirtualChassisTrackAngVelZExp(ManagerTermBase):
@@ -266,6 +339,65 @@ class VirtualChassisLateralVelocityPenalty(ManagerTermBase):
         stop_error = torch.sum(torch.square(actual_xy), dim=1)
         moving = command_norm.squeeze(1) > command_deadband
         return torch.where(moving, lateral_error, stop_error)
+
+
+class VirtualChassisHeadingDriftPenalty(ManagerTermBase):
+    """Penalize heading drift of the virtual chassis from its reset heading."""
+
+    def __init__(self, cfg, env: "ManagerBasedRLEnv"):
+        super().__init__(cfg, env)
+        self.asset_cfg: SceneEntityCfg = cfg.params["asset_cfg"]
+        self.asset: Articulation = env.scene[self.asset_cfg.name]
+        self.prev_axes_w = torch.zeros(self.num_envs, 3, 3, device=self.device)
+        self.has_prev_axes = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        self.initial_heading = torch.zeros(self.num_envs, device=self.device)
+        self.has_initial_heading = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+
+    def reset(self, env_ids=None) -> dict[str, float]:
+        env_ids = _resolve_env_ids(self.num_envs, self.device, env_ids)
+        if env_ids is None:
+            self.prev_axes_w.zero_()
+            self.has_prev_axes.zero_()
+            self.initial_heading.zero_()
+            self.has_initial_heading.zero_()
+        else:
+            self.prev_axes_w[env_ids] = 0.0
+            self.has_prev_axes[env_ids] = False
+            self.initial_heading[env_ids] = 0.0
+            self.has_initial_heading[env_ids] = False
+        return {}
+
+    def __call__(self, env: "ManagerBasedRLEnv", asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")) -> torch.Tensor:
+        body_pos_w = self.asset.data.body_pos_w[:, self.asset_cfg.body_ids, :]
+        body_lin_vel_w = self.asset.data.body_lin_vel_w[:, self.asset_cfg.body_ids, :]
+        body_ang_vel_w = self.asset.data.body_ang_vel_w[:, self.asset_cfg.body_ids, :]
+        if not torch.isfinite(body_pos_w).all():
+            return torch.zeros(self.num_envs, device=self.device)
+
+        _, axes_w, _, _ = compute_virtual_chassis_command_terms(
+            body_pos_w=body_pos_w,
+            body_lin_vel_w=body_lin_vel_w,
+            body_ang_vel_w=body_ang_vel_w,
+            prev_axes_w=self.prev_axes_w,
+            has_prev=self.has_prev_axes,
+        )
+        if not torch.isfinite(axes_w).all():
+            return torch.zeros(self.num_envs, device=self.device)
+
+        self.prev_axes_w.copy_(axes_w)
+        self.has_prev_axes[:] = True
+
+        x_axis_w = axes_w[:, :, 0]
+        heading = torch.atan2(x_axis_w[:, 1], x_axis_w[:, 0])
+        init_mask = ~self.has_initial_heading
+        if init_mask.any():
+            self.initial_heading[init_mask] = heading[init_mask]
+            self.has_initial_heading[init_mask] = True
+        heading_error = torch.atan2(
+            torch.sin(heading - self.initial_heading),
+            torch.cos(heading - self.initial_heading),
+        )
+        return torch.square(heading_error)
 
 
 class VirtualChassisYawRateAbsPenalty(ManagerTermBase):

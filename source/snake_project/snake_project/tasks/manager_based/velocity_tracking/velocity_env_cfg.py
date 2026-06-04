@@ -94,7 +94,7 @@ class SnakeVelocityCommandsCfg:
         velocity_marker_z_offset=0.10,
         ranges=mdp.VirtualChassisVelocityCommandCfg.Ranges(
             lin_vel_x=(-0.25, 0.25),
-            lin_vel_y=(-0.12, 0.12),
+            lin_vel_y=(-0.10, 0.10),
             ang_vel_z=(-0.0, 0.0),
             heading=(-0.0, 0.0),
         ),
@@ -179,26 +179,26 @@ class SnakeVelocityEventCfg:
             },
         },
     )
-    """
+
     randomize_robot_material = EventTerm(
         func=mdp.randomize_rigid_body_material,
         mode="startup",
         params={
             "asset_cfg": SceneEntityCfg("robot"),
-            "static_friction_range": (0.3, 1.0),
-            "dynamic_friction_range": (0.3, 1.0),
+            "static_friction_range": (0.8, 1.2),
+            "dynamic_friction_range": (0.8, 1.2),
             "restitution_range": (0.0, 0.0),
             "num_buckets": 64,
             "make_consistent": True,
         },
     )
-    
+
     randomize_link_mass = EventTerm(
         func=mdp.randomize_rigid_body_mass,
         mode="reset",
         params={
             "asset_cfg": SceneEntityCfg("robot"),
-            "mass_distribution_params": (0.90, 1.10),
+            "mass_distribution_params": (0.95, 1.05),
             "operation": "scale",
             "distribution": "uniform",
         },
@@ -210,26 +210,24 @@ class SnakeVelocityEventCfg:
         params={
             "asset_cfg": SceneEntityCfg("robot"),
             "com_range": {
-                "x": (-0.005, 0.005),
-                "y": (-0.005, 0.005),
-                "z": (-0.005, 0.005),
+                "x": (-0.002, 0.002),
+                "y": (-0.002, 0.002),
+                "z": (-0.002, 0.002),
             },
         },
     )
-    
 
     randomize_actuator_gains = EventTerm(
         func=mdp.randomize_actuator_gains,
         mode="reset",
         params={
-            "asset_cfg": SceneEntityCfg("robot", joint_names=JOINT_NAMES),
-            "stiffness_distribution_params": (0.90, 1.10),
-            "damping_distribution_params": (0.90, 1.10),
+            "asset_cfg": yaw_joint_cfg(),
+            "stiffness_distribution_params": (0.9, 1.1),
+            "damping_distribution_params": (0.9, 1.1),
             "operation": "scale",
             "distribution": "uniform",
         },
     )
-    """
 
 @configclass
 class SnakeVelocityRewardsCfg:
@@ -242,8 +240,13 @@ class SnakeVelocityRewardsCfg:
     )
     track_ang_vel_z_exp = RewTerm(
         func=mdp.VirtualChassisTrackAngVelZExp,
-        weight=1.5,
+        weight=1.8,
         params={"command_name": "base_velocity", "std": 0.25, "asset_cfg": virtual_chassis_body_cfg()},
+    )
+    track_lin_vel_y_exp = RewTerm(
+        func=mdp.VirtualChassisTrackVelYExp,
+        weight=1.2,
+        params={"command_name": "base_velocity", "std": 0.12, "linear_coef": 0.3, "asset_cfg": virtual_chassis_body_cfg()},
     )
     ang_vel_xy_l2 = RewTerm(func=mdp.ang_vel_xy_l2, weight=-0.05)
     joint_torques_l2 = RewTerm(func=mdp.joint_torques_l2, weight=-1.0e-4, params={"asset_cfg": yaw_joint_cfg()})
@@ -256,11 +259,22 @@ class SnakeVelocityRewardsCfg:
     )
     vc_yaw_rate_abs = RewTerm(
         func=mdp.VirtualChassisYawRateAbsPenalty,
-        weight=-0.2,
+        weight=-0.3,
+        params={"asset_cfg": virtual_chassis_body_cfg()},
+    )
+    vc_heading_drift_l2 = RewTerm(
+        func=mdp.VirtualChassisHeadingDriftPenalty,
+        weight=-0.18,
         params={"asset_cfg": virtual_chassis_body_cfg()},
     )
     joint_curvature_l2 = RewTerm(func=mdp.joint_curvature_l2, weight=-0.04, params={"asset_cfg": yaw_joint_cfg()})
     joint_mean_bend_l2 = RewTerm(func=mdp.joint_mean_bend_l2, weight=-0.05, params={"asset_cfg": yaw_joint_cfg()})
+    leader_follower_joint_pos_l2 = RewTerm(
+        func=mdp.leader_follower_joint_pos_l2, weight=-0.06, params={"asset_cfg": yaw_joint_cfg()}
+    )
+    leader_follower_joint_vel_l2 = RewTerm(
+        func=mdp.leader_follower_joint_vel_l2, weight=-0.008, params={"asset_cfg": yaw_joint_cfg()}
+    )
     joint_amplitude = RewTerm(func=mdp.joint_amplitude, weight=0.15, params={"asset_cfg": yaw_joint_cfg()})
     phase_propagation = RewTerm(func=mdp.phase_propagation, weight=0.3, params={"asset_cfg": yaw_joint_cfg()})
     motion_coordination = RewTerm(func=mdp.motion_coordination, weight=-0.4, params={"asset_cfg": yaw_joint_cfg()})
@@ -291,8 +305,10 @@ class SnakeVelocityCurriculumCfg:
         params={
             "command_name": "base_velocity",
             "reward_term_name": "track_lin_vel_xy_exp",
-            "max_curriculum": 0.25,
-            "min_curriculum": 0.05,
+            "max_curriculum_x": 0.25,
+            "max_curriculum_y": 0.10,
+            "min_curriculum_x": 0.05,
+            "min_curriculum_y": 0.03,
             "step_size": 0.025,
             "threshold_ratio": 0.75,
         },
